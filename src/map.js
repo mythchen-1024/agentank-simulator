@@ -1,6 +1,9 @@
 const PLAYER_ONE = "abcd";
 const PLAYER_TWO = "ABCD";
 const DIRECTIONS_BY_CHAR = ["up", "right", "down", "left"];
+// Players 0/1 keep the directional abcd/ABCD glyphs. Players 2-9 use a single digit (position
+// only, direction defaults to "up"); richer config (direction/team/name) comes via options.tanks.
+const EXTRA_PLAYER_CHARS = "23456789";
 
 export function parseRawMap(rawMap) {
   if (Array.isArray(rawMap)) return normalizeMap(rawMap);
@@ -16,9 +19,14 @@ export function parseRawMap(rawMap) {
       const char = row[x] || ".";
       const p1 = PLAYER_ONE.indexOf(char);
       const p2 = PLAYER_TWO.indexOf(char);
+      const extra = EXTRA_PLAYER_CHARS.indexOf(char);
       if (p1 >= 0 || p2 >= 0) {
         const index = p1 >= 0 ? 0 : 1;
         tanks[index] = { position: [x, y], direction: DIRECTIONS_BY_CHAR[p1 >= 0 ? p1 : p2] || "up" };
+        map[x][y] = ".";
+      } else if (extra >= 0) {
+        // "2" -> player index 2, "3" -> 3, ...
+        tanks[extra + 2] = { position: [x, y], direction: "up" };
         map[x][y] = ".";
       } else {
         map[x][y] = char === "x" || char === "m" || char === "o" ? char : ".";

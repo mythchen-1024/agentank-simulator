@@ -21,6 +21,7 @@ import {
   isSamePoint,
   normalizeMap,
   parseRawMap,
+  pointKey,
   setTerrain,
   terrainAt
 } from "./map.js";
@@ -50,7 +51,22 @@ export class AgenTankSimulator {
     this.nextObjectId = 1;
     this.records = [];
     this.result = null;
-    this.players = [0, 1].map((index) => createPlayer(index, tanks[index], options.skills?.[index] || tanks[index]?.skillType));
+    const teams = resolveTeams(options, tanks);
+    this.mode = options.mode || (teams ? "teams" : "ffa");
+    this.players = tanks.map((tank, index) => createPlayer(
+      index,
+      tank,
+      options.skills?.[index] || tank?.skillType,
+      this.mode === "teams" ? teams[index] : null,
+      options.names?.[index] ?? tank?.name
+    ));
+    // Legacy (1v1) keeps the slim { winner, reason } result; multiplayer adds ranking/eliminations.
+    this.multiplayer = this.players.length > 2 || this.mode === "teams";
+    this.eliminations = [];
+    // Team chat is delivered with one frame of latency: messages sent during frame N are read
+    // from the inbox on frame N+1. teamInfoNextInbox accumulates this frame's sends.
+    this.teamInfoInbox = new Map();
+    this.teamInfoNextInbox = new Map();
     this.bullets = [];
     this.bombs = [];
     this.pendingStarEvents = [];
@@ -70,7 +86,12 @@ export class AgenTankSimulator {
     copy.star = this.star ? this.star.slice() : null;
     copy.nextObjectId = this.nextObjectId;
     copy.records = [];
-    copy.result = this.result ? { ...this.result } : null;
+    copy.result = this.result ? cloneResult(this.result) : null;
+    copy.mode = this.mode;
+    copy.multiplayer = this.multiplayer;
+    copy.eliminations = this.eliminations.map((entry) => ({ ...entry }));
+    copy.teamInfoInbox = cloneInbox(this.teamInfoInbox);
+    copy.teamInfoNextInbox = cloneInbox(this.teamInfoNextInbox);
     copy.players = this.players.map((player) => clonePlayer(player));
     copy.bullets = this.bullets.map((bullet) => ({ ...bullet, position: bullet.position.slice() }));
     copy.bombs = this.bombs.map((bomb) => ({ ...bomb, position: bomb.position.slice() }));
@@ -80,15 +101,34 @@ export class AgenTankSimulator {
 
   snapshotFor(playerIndex) {
     const me = this.players[playerIndex];
-    const enemy = this.players[playerIndex === 0 ? 1 : 0];
+    const primaryIndex = this.primaryOpponentIndexFor(me);
+    const enemyPlayer = primaryIndex == null ? null : this.players[primaryIndex];
+    const enemies = this.players
+      .filter((player) => player !== me && this.areEnemies(me.index, player.index))
+      .map((player) => this.unitSnapshot(player, me))
+      .filter((snapshot) => snapshot.tank);
+    const allies = this.mode === "teams"
+      ? this.players
+        .filter((player) => player !== me && !player.crashed && !this.areEnemies(me.index, player.index))
+        .map((player) => this.unitSnapshot(player, me))
+        .filter((snapshot) => snapshot.tank)
+      : [];
     return {
       me: this.agentSnapshot(me, me),
-      enemy: this.agentSnapshot(enemy, me),
+      enemy: enemyPlayer ? this.agentSnapshot(enemyPlayer, me) : nullEnemySnapshot(),
       game: {
         frames: this.frame,
+        myIndex: me.index,
+        alivePlayers: this.players.filter((player) => !player.crashed).length,
+        team: this.mode === "teams" ? "ally" : null,
         star: this.star ? this.star.slice() : null,
         map: cloneMap(this.map),
-        bombs: this.visibleBombsFor(me)
+        bombs: this.visibleBombsFor(me),
+        enemies,
+        allies,
+        players: this.players.map((player) => this.unitSnapshot(player, me)),
+        visibleBullets: this.visibleBulletsFor(me),
+        teamInfo: this.teamInfoFor(me)
       }
     };
   }
@@ -96,6 +136,9 @@ export class AgenTankSimulator {
   agentSnapshot(player, observer) {
     const visibleTank = this.visibleTankFor(player, observer);
     return {
+      index: player.index,
+      team: relativeTeam(player, observer, this.mode),
+      name: player.name,
       tank: visibleTank,
       stars: player.stars,
       bullet: this.visibleBulletFor(player, observer),
@@ -113,9 +156,13 @@ export class AgenTankSimulator {
     };
   }
 
+  unitSnapshot(player, observer) {
+    return this.agentSnapshot(player, observer);
+  }
+
   visibleTankFor(player, observer) {
     if (!player || player.crashed) return null;
-    if (player !== observer && hasActiveSelfEffect(player, "cloak", this.frame)) {
+    if (player !== observer && player.effects.self?.type === "cloak") {
       return null;
     }
     if (player !== observer && isGrass(this.map, player.position[0], player.position[1])) {
@@ -142,11 +189,35 @@ export class AgenTankSimulator {
     return null;
   }
 
-  run(botA, botB) {
+  visibleBulletsFor(observer) {
+    const result = [];
+    for (const bullet of this.bullets) {
+      if (bullet.crashed) continue;
+      const owner = this.players[bullet.ownerIndex];
+      if (owner === observer || visibleEnemyBullet(this.map, observer, bullet)) {
+        result.push({ position: bullet.position.slice(), direction: bullet.direction });
+      }
+    }
+    return result;
+  }
+
+  teamInfoFor(observer) {
+    if (this.mode !== "teams") return [];
+    const inbox = this.teamInfoInbox.get(observer.team) || [];
+    return inbox.map((message) => ({
+      from: message.from,
+      type: message.type,
+      content: message.content,
+      location: message.location ? message.location.slice() : null
+    }));
+  }
+
+  run(...bots) {
+    const list = bots.length === 1 && Array.isArray(bots[0]) ? bots[0] : bots;
     while (!this.result && this.frame < this.maxFrames) {
-      const decisions = [botA, botB].map((bot, index) => {
-        const player = this.players[index];
-        if (!bot || player.crashed || !canActThisFrame(player, this.frame)) return { action: null, logs: [], runtimeMs: 0 };
+      const decisions = this.players.map((player, index) => {
+        const bot = list[index];
+        if (!bot || player.crashed || !canActThisFrame(player, this.frame)) return { action: null, logs: [], runtimeMs: 0, teamInfo: [] };
         return bot.decide(this.snapshotFor(index));
       });
       this.step(decisions.map((item) => item.action), decisions);
@@ -155,11 +226,12 @@ export class AgenTankSimulator {
     return this.toReplayData();
   }
 
-  async runAsync(botA, botB) {
+  async runAsync(...bots) {
+    const list = bots.length === 1 && Array.isArray(bots[0]) ? bots[0] : bots;
     while (!this.result && this.frame < this.maxFrames) {
-      const decisions = await Promise.all([botA, botB].map((bot, index) => {
-        const player = this.players[index];
-        if (!bot || player.crashed || !canActThisFrame(player, this.frame)) return { action: null, logs: [], runtimeMs: 0 };
+      const decisions = await Promise.all(this.players.map((player, index) => {
+        const bot = list[index];
+        if (!bot || player.crashed || !canActThisFrame(player, this.frame)) return { action: null, logs: [], runtimeMs: 0, teamInfo: [] };
         return bot.decide(this.snapshotFor(index));
       }));
       this.step(decisions.map((item) => item.action), decisions);
@@ -184,13 +256,12 @@ export class AgenTankSimulator {
 
     const startPositions = this.players.map((player) => player.position.slice());
     const moveIntentByIndex = new Map();
-    for (const index of [0, 1]) {
+    for (let index = 0; index < this.players.length; index += 1) {
       const player = this.players[index];
       const action = normalizedActionForPlayer(player, actions[index], this.frame, this.rng);
       actions[index] = action;
-      const canTurnGo = action?.type === "turnGo" && player.effects.self?.type === "boost";
-      if (!player.crashed && (action?.type === "go" || canTurnGo)) {
-        const moveDirection = canTurnGo
+      if (!player.crashed && (action?.type === "go" || action?.type === "turnGo")) {
+        const moveDirection = action.type === "turnGo"
           ? turnDirection(player.direction, action.side === "left" ? "left" : "right")
           : player.direction;
         const delta = directionDelta(moveDirection);
@@ -198,7 +269,7 @@ export class AgenTankSimulator {
       }
     }
 
-    for (const index of [0, 1]) {
+    for (let index = 0; index < this.players.length; index += 1) {
       const decision = decisions[index] || {};
       for (const log of decision.logs || []) {
         if (log.type === "speak") {
@@ -229,6 +300,7 @@ export class AgenTankSimulator {
       }
     }
 
+    this.collectTeamInfo(decisions);
     this.records.push(frameEvents);
     this.frame += 1;
     return frameEvents;
@@ -251,7 +323,7 @@ export class AgenTankSimulator {
       }
       return;
     }
-    if (action.type === "turnGo" && player.effects.self?.type === "boost") {
+    if (action.type === "turnGo") {
       const side = action.side === "left" ? "left" : "right";
       player.direction = turnDirection(player.direction, side);
       events.push({ type: "tank", action: "turn", direction: side, objectId: player.objectId, free: true });
@@ -262,7 +334,7 @@ export class AgenTankSimulator {
       }
       return;
     }
-    if (action.type === "turnFire" && player.effects.self?.type === "boost") {
+    if (action.type === "turnFire") {
       const side = action.side === "left" ? "left" : "right";
       player.direction = turnDirection(player.direction, side);
       events.push({ type: "tank", action: "turn", direction: side, objectId: player.objectId, free: true });
@@ -365,10 +437,11 @@ export class AgenTankSimulator {
     for (const player of this.players) {
       if (player.crashed || !cells.some((cell) => isSamePoint(cell, player.position))) continue;
       if (player.effects.self?.type === "shield") {
+        // 炸弹与盾：平台未文档化两发规则，保持一次击碎；复用上游 expireShield 统一事件格式
         expireShield(player, events);
         continue;
       }
-      this.crashTank(player, events, { deferResult: true });
+      this.crashTank(player, events, { deferResult: true, reason: "bomb", by: bomb.ownerIndex });
     }
   }
 
@@ -450,8 +523,9 @@ export class AgenTankSimulator {
         player.starPickupLockedUntil || 0,
         this.frame + TELEPORT_STAR_PICKUP_LOCK_FRAMES + 1
       );
-      const enemy = this.players[player.index === 0 ? 1 : 0];
-      if (!enemy.crashed && manhattan(player.position, enemy.position) <= 4) {
+      const primaryIndex = this.primaryOpponentIndexFor(player);
+      const enemy = primaryIndex == null ? null : this.players[primaryIndex];
+      if (enemy && !enemy.crashed && manhattan(player.position, enemy.position) <= 4) {
         player.fireLockedUntil = Math.max(player.fireLockedUntil || 0, this.frame + 3);
       }
       events.push({
@@ -469,9 +543,10 @@ export class AgenTankSimulator {
     }
 
     if (type === "freeze" || type === "stun" || type === "poison") {
-      const enemy = this.players[player.index === 0 ? 1 : 0];
+      const primaryIndex = this.primaryOpponentIndexFor(player);
+      const enemy = primaryIndex == null ? null : this.players[primaryIndex];
       const duration = SKILL_DURATION_FRAMES[type] || 0;
-      if (!duration || enemy.crashed) return;
+      if (!duration || !enemy || enemy.crashed) return;
       const expiresAt = this.frame + duration + (type === "stun" ? 1 : 0);
       enemy.effects.debuff = { type, expiresAt };
       events.push({
@@ -488,6 +563,7 @@ export class AgenTankSimulator {
 
     const duration = SKILL_DURATION_FRAMES[type] || 0;
     if (!duration) return;
+    // 与上游对齐：护盾用 SHIELD_BULLET_HITS，其它自技能无 hitsRemaining
     player.effects.self = {
       type,
       expiresAt: this.frame + duration,
@@ -521,22 +597,24 @@ export class AgenTankSimulator {
         const shieldedTank = this.players.find((player) => (
           !player.crashed &&
           player.index !== bullet.ownerIndex &&
+          this.areEnemies(bullet.ownerIndex, player.index) &&
           player.effects.self?.type === "shield" &&
           isSamePoint(player.position, next)
         ));
         if (shieldedTank) {
           bullet.position = next;
           events.push(this.bulletGoEvent(bullet, owner, order));
+          // 与上游对齐：挡弹次数递减逻辑集中在 absorbShieldBulletHit
           absorbShieldBulletHit(shieldedTank, events);
           events.push(this.bulletCrashEvent(bullet, owner));
           alive = false;
           break;
         }
-        const hitTank = this.players.find((player) => !player.crashed && isSamePoint(player.position, next));
+        const hitTank = this.players.find((player) => !player.crashed && this.areEnemies(bullet.ownerIndex, player.index) && isSamePoint(player.position, next));
         if (hitTank) {
           bullet.position = next;
           events.push(this.bulletGoEvent(bullet, owner, order));
-          this.crashTank(hitTank, events, { deferResult: true });
+          this.crashTank(hitTank, events, { deferResult: true, reason: "bullet", by: bullet.ownerIndex });
           events.push(this.bulletCrashEvent(bullet, owner));
           alive = false;
           break;
@@ -620,30 +698,53 @@ export class AgenTankSimulator {
   }
 
   checkTankCollision(events) {
-    const [a, b] = this.players;
-    if (!a.crashed && !b.crashed && isSamePoint(a.position, b.position)) {
-      this.crashTank(a, events);
-      this.crashTank(b, events);
+    const byCell = new Map();
+    for (const player of this.players) {
+      if (player.crashed) continue;
+      const key = pointKey(player.position);
+      if (!byCell.has(key)) byCell.set(key, []);
+      byCell.get(key).push(player);
     }
+    let collided = false;
+    for (const group of byCell.values()) {
+      if (group.length < 2) continue;
+      for (const player of group) {
+        if (group.some((other) => other !== player && this.areEnemies(player.index, other.index))) {
+          this.crashTank(player, events, { deferResult: true, reason: "collision", by: null });
+          collided = true;
+        }
+      }
+    }
+    if (collided) this.resolveCrashResult();
   }
 
   crashTank(player, events, options = {}) {
     if (player.crashed) return;
     player.crashed = true;
+    player.deathFrame = this.frame;
+    this.eliminations.push({
+      index: player.index,
+      who: player.objectId,
+      reason: options.reason || "unknown",
+      by: options.by ?? null,
+      frame: this.frame
+    });
     events.push({ type: "tank", action: "crashed", objectId: player.objectId, index: player.index });
     if (options.deferResult) return;
     this.resolveCrashResult();
   }
 
   resolveCrashResult() {
-    const crashed = this.players.filter((player) => player.crashed);
-    if (crashed.length === 0) return;
-    if (crashed.length === 2) {
-      this.result = { winner: this.tieBreakWinner(), reason: "crashed" };
-      return;
+    const reason = this.matchOverReason();
+    if (reason) this.finalize(reason);
+  }
+
+  matchOverReason() {
+    const alive = this.players.filter((player) => !player.crashed);
+    if (this.mode === "teams") {
+      return new Set(alive.map((player) => player.team)).size <= 1 ? "crashed" : null;
     }
-    const survivor = this.players.find((player) => !player.crashed);
-    this.result = { winner: survivor ? survivor.index : null, reason: "crashed" };
+    return alive.length <= 1 ? "crashed" : null;
   }
 
   isFireLocked(player) {
@@ -671,23 +772,126 @@ export class AgenTankSimulator {
   checkWin() {
     if (!this.starLimit) return;
     for (const player of this.players) {
-      if (player.stars >= this.starLimit) this.result = { winner: player.index, reason: "star" };
+      if (player.stars >= this.starLimit) {
+        this.finalize("star", player.index);
+        return;
+      }
     }
   }
 
   finishByScore() {
-    const [a, b] = this.players;
-    const winner = this.tieBreakWinner();
-    this.result = { winner, reason: "frameLimit" };
+    this.finalize("frameLimit");
   }
 
-  tieBreakWinner() {
-    const [a, b] = this.players;
-    if (a.stars !== b.stars) return a.stars > b.stars ? 0 : 1;
-    const ar = a.runTimeMs || 0;
-    const br = b.runTimeMs || 0;
-    if (ar === br) return null;
-    return ar < br ? 0 : 1;
+  finalize(reason, forcedWinnerIndex = null) {
+    if (this.result) return;
+    const ranking = this.computeRanking();
+    const winner = forcedWinnerIndex != null
+      ? forcedWinnerIndex
+      : (ranking.length ? this.resolveWinner(ranking) : null);
+    const result = { winner, reason };
+    if (this.multiplayer) {
+      result.ranking = ranking;
+      result.eliminations = this.eliminations.map((entry) => ({ ...entry }));
+    }
+    this.result = result;
+  }
+
+  resolveWinner(ranking) {
+    // Legacy 1v1 preserves the documented null-on-perfect-tie behaviour, but only when neither
+    // tank has an edge — a lone survivor always wins outright.
+    if (!this.multiplayer && ranking.length === 2) {
+      const [a, b] = ranking.map((index) => this.players[index]);
+      if (a.crashed === b.crashed && a.stars === b.stars && (a.runTimeMs || 0) === (b.runTimeMs || 0)) return null;
+    }
+    return ranking[0];
+  }
+
+  computeRanking() {
+    const personalCmp = (a, b) =>
+      (Number(b.crashed === false) - Number(a.crashed === false)) ||
+      (b.stars - a.stars) ||
+      ((a.runTimeMs || 0) - (b.runTimeMs || 0)) ||
+      ((b.deathFrame ?? 0) - (a.deathFrame ?? 0)) ||
+      (a.index - b.index);
+    if (this.mode !== "teams") {
+      return [...this.players].sort(personalCmp).map((player) => player.index);
+    }
+    const teams = new Map();
+    for (const player of this.players) {
+      if (!teams.has(player.team)) teams.set(player.team, []);
+      teams.get(player.team).push(player);
+    }
+    const teamStats = [...teams.entries()].map(([team, members]) => ({
+      team,
+      members,
+      alive: members.filter((player) => !player.crashed).length,
+      stars: members.reduce((sum, player) => sum + (player.stars || 0), 0),
+      runTimeMs: members.reduce((sum, player) => sum + (player.runTimeMs || 0), 0)
+    }));
+    teamStats.sort((a, b) =>
+      (b.alive - a.alive) ||
+      (b.stars - a.stars) ||
+      (a.runTimeMs - b.runTimeMs) ||
+      compareTeamId(a.team, b.team)
+    );
+    const ranking = [];
+    for (const stat of teamStats) {
+      for (const player of [...stat.members].sort(personalCmp)) ranking.push(player.index);
+    }
+    return ranking;
+  }
+
+  collectTeamInfo(decisions) {
+    if (this.mode !== "teams") return;
+    const ALLOWED = new Set(["alert", "bomb", "help", "info", "move", "plan", "star", "target", "warn"]);
+    for (let index = 0; index < this.players.length; index += 1) {
+      const player = this.players[index];
+      if (player.crashed) continue;
+      const first = (decisions[index]?.teamInfo || [])[0];
+      if (!first || !ALLOWED.has(first.type)) continue;
+      let bytes;
+      try {
+        bytes = Buffer.byteLength(JSON.stringify(first.content ?? ""));
+      } catch {
+        continue;
+      }
+      if (bytes > 1024) continue;
+      const entry = {
+        from: player.index,
+        team: player.team,
+        type: first.type,
+        content: first.content,
+        location: Array.isArray(first.location) ? first.location.slice() : null
+      };
+      if (!this.teamInfoNextInbox.has(player.team)) this.teamInfoNextInbox.set(player.team, []);
+      this.teamInfoNextInbox.get(player.team).push(entry);
+    }
+    this.teamInfoInbox = this.teamInfoNextInbox;
+    this.teamInfoNextInbox = new Map();
+  }
+
+  primaryOpponentIndexFor(me) {
+    let best = null;
+    let bestScore = Infinity;
+    for (const enemy of this.players) {
+      if (enemy === me || enemy.crashed || !this.areEnemies(me.index, enemy.index)) continue;
+      const hasBullet = this.bullets.some((bullet) => bullet.ownerIndex === enemy.index && !bullet.crashed);
+      const score = threatScore(me, enemy, hasBullet);
+      if (score < bestScore) {
+        bestScore = score;
+        best = enemy.index;
+      }
+    }
+    return best;
+  }
+
+  areEnemies(i, j) {
+    const a = this.players[i];
+    const b = this.players[j];
+    if (!a || !b) return false;
+    if (this.mode !== "teams") return i !== j;
+    return a.team !== b.team;
   }
 
   randomStar() {
@@ -754,6 +958,8 @@ export class AgenTankSimulator {
                 position: player.startPosition.slice(),
                 direction: player.startDirection
               },
+              team: player.team,
+              name: player.name,
               runTime: player.runTimeMs
             })),
             result: this.result
@@ -793,8 +999,11 @@ function cloneEvent(event) {
 }
 
 function validateTankStarts(tanks) {
-  if (!Array.isArray(tanks) || !isValidTankStart(tanks[0]) || !isValidTankStart(tanks[1])) {
+  if (!Array.isArray(tanks) || tanks.length < 2) {
     throw new Error("Simulator requires two tank start states");
+  }
+  for (let i = 0; i < tanks.length; i += 1) {
+    if (!isValidTankStart(tanks[i])) throw new Error("Simulator requires two tank start states");
   }
 }
 
@@ -802,12 +1011,30 @@ function isValidTankStart(tank) {
   return Boolean(tank && Array.isArray(tank.position) && tank.position.length >= 2);
 }
 
-function createPlayer(index, tank, skillType) {
+function resolveTeams(options, tanks) {
+  if (options.mode === "ffa") return null;
+  if (Array.isArray(options.teams) && options.teams.length) {
+    return tanks.map((tank, index) => options.teams[index] ?? tank?.team ?? defaultTeam(index, tanks.length));
+  }
+  if (options.mode === "teams" || tanks.some((tank) => tank && tank.team != null)) {
+    return tanks.map((tank, index) => tank?.team ?? defaultTeam(index, tanks.length));
+  }
+  return null;
+}
+
+function defaultTeam(index, count) {
+  return index < Math.ceil(count / 2) ? 0 : 1;
+}
+
+function createPlayer(index, tank, skillType, team, name) {
   const position = tank.position ? tank.position.slice() : [0, 0];
   const direction = tank.direction || "up";
+  const objectId = tank.id || `tank${index + 1}`;
   return {
     index,
-    objectId: tank.id || `tank${index + 1}`,
+    objectId,
+    team: team ?? null,
+    name: name ?? objectId,
     startPosition: position.slice(),
     startDirection: direction,
     position,
@@ -821,36 +1048,25 @@ function createPlayer(index, tank, skillType) {
     starPickupLockedUntil: 0,
     runTimeMs: 0,
     crashed: false,
+    deathFrame: null,
     teleportRevealUntil: -1,
     effects: { self: null, debuff: null }
   };
 }
 
-function activeEffect(effect, frame) {
-  return Boolean(effect && effect.expiresAt > frame);
-}
-
-function hasActiveSelfEffect(player, type, frame) {
-  return activeEffect(player.effects.self, frame) && player.effects.self.type === type;
-}
-
-function hasActiveDebuffEffect(player, type, frame) {
-  return activeEffect(player.effects.debuff, frame) && player.effects.debuff.type === type;
-}
-
-function isControlled(player, frame) {
-  return hasActiveDebuffEffect(player, "freeze", frame);
+function isControlled(player) {
+  return player.effects.debuff?.type === "freeze";
 }
 
 function canActThisFrame(player, frame) {
-  if (isControlled(player, frame)) return false;
-  if (hasActiveDebuffEffect(player, "poison", frame)) return frame % 2 === 0;
+  if (isControlled(player)) return false;
+  if (player.effects.debuff?.type === "poison") return frame % 2 === 0;
   return true;
 }
 
 function normalizedActionForPlayer(player, action, frame, rng) {
   if (!action || player.crashed || !canActThisFrame(player, frame)) return null;
-  if (!hasActiveDebuffEffect(player, "stun", frame)) return action;
+  if (player.effects.debuff?.type !== "stun") return action;
   if (action.type === "turn") {
     const side = rng() < 0.5 ? action.side : oppositeSide(action.side);
     return {
@@ -906,34 +1122,32 @@ function expireShield(player, events) {
 }
 
 function statusFor(player, frame = 0) {
-  const poisoned = hasActiveDebuffEffect(player, "poison", frame);
+  const poisoned = player.effects.debuff?.type === "poison";
   return {
-    boosted: hasActiveSelfEffect(player, "boost", frame),
-    overloaded: hasActiveSelfEffect(player, "overload", frame),
+    boosted: player.effects.self?.type === "boost",
+    overloaded: player.effects.self?.type === "overload",
     fireLocked: (player.fireLockedUntil || 0) > frame,
     bombCooldownFrames: Math.max(0, (player.bombCooldownUntil || 0) - frame),
     bombActive: false,
-    shielded: hasActiveSelfEffect(player, "shield", frame),
-    stunned: hasActiveDebuffEffect(player, "stun", frame),
-    frozen: hasActiveDebuffEffect(player, "freeze", frame),
+    shielded: player.effects.self?.type === "shield",
+    stunned: player.effects.debuff?.type === "stun",
+    frozen: player.effects.debuff?.type === "freeze",
     poisoned,
-    cloaked: hasActiveSelfEffect(player, "cloak", frame),
+    cloaked: player.effects.self?.type === "cloak",
     actionSpeed: poisoned ? 0.5 : 1,
     canActThisFrame: canActThisFrame(player, frame)
   };
 }
 
 function effectsFor(player, frame = 0) {
-  const self = activeEffect(player.effects.self, frame) ? player.effects.self : null;
-  const debuff = activeEffect(player.effects.debuff, frame) ? player.effects.debuff : null;
   return {
-    self: self ? {
-      type: self.type,
-      remainingFrames: self.expiresAt - frame
+    self: player.effects.self ? {
+      type: player.effects.self.type,
+      remainingFrames: Math.max(0, player.effects.self.expiresAt - frame)
     } : null,
-    debuff: debuff ? {
-      type: debuff.type,
-      remainingFrames: debuff.expiresAt - frame
+    debuff: player.effects.debuff ? {
+      type: player.effects.debuff.type,
+      remainingFrames: Math.max(0, player.effects.debuff.expiresAt - frame)
     } : null
   };
 }
@@ -950,12 +1164,67 @@ function publicPlayerState(player, frame = 0) {
   return {
     index: player.index,
     objectId: player.objectId,
+    team: player.team,
+    name: player.name,
     position: player.position.slice(),
     direction: player.direction,
     stars: player.stars,
     skillType: player.skillType,
     status: statusFor(player, frame)
   };
+}
+
+function relativeTeam(player, observer, mode) {
+  if (mode !== "teams") return null;
+  return player.team === observer.team ? "ally" : "enemy";
+}
+
+// Threat-score selection of the primary opponent (onIdle's enemy arg + single-target skill aim).
+// Pure, no RNG, runs on real coordinates (no fog) so debuffs can still target through walls.
+// Lower score = higher priority. Mirrors the official guide's example weights.
+function threatScore(me, enemy, hasBullet) {
+  let score = manhattan(me.position, enemy.position);
+  if ((enemy.stars || 0) > (me.stars || 0)) score -= 3;
+  if (hasBullet) score -= 5;
+  if (enemy.crashed) score += 999;
+  return score;
+}
+
+function nullEnemySnapshot() {
+  return {
+    index: null,
+    team: null,
+    name: null,
+    tank: null,
+    stars: 0,
+    bullet: null,
+    skill: null,
+    status: {},
+    effects: { self: null, debuff: null }
+  };
+}
+
+function compareTeamId(a, b) {
+  if (a === b) return 0;
+  return String(a) < String(b) ? -1 : 1;
+}
+
+function cloneInbox(inbox) {
+  const copy = new Map();
+  for (const [team, messages] of inbox) {
+    copy.set(team, messages.map((message) => ({
+      ...message,
+      location: Array.isArray(message.location) ? message.location.slice() : message.location
+    })));
+  }
+  return copy;
+}
+
+function cloneResult(result) {
+  const copy = { ...result };
+  if (Array.isArray(result.ranking)) copy.ranking = result.ranking.slice();
+  if (Array.isArray(result.eliminations)) copy.eliminations = result.eliminations.map((entry) => ({ ...entry }));
+  return copy;
 }
 
 function visibleEnemyBullet(map, observer, bullet) {
