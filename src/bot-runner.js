@@ -51,12 +51,14 @@ export class BotRunner {
 
   decide(context) {
     if (this.queue.length > 0) {
+      // 上游 queue guard：转向被压制时清空队列；多坦克侧补 teamInfo 空数组保持决策结构一致
       const queued = this.shiftQueuedDecision(context.me);
       if (queued) return queued;
     }
     this.logs.length = 0;
     const actions = [];
-    const me = createAgentProxy(context.me, actions, this.logs);
+    const teamInfo = [];
+    const me = createAgentProxy(context.me, actions, this.logs, teamInfo);
     const enemy = context.enemy;
     const game = context.game;
     const started = process.hrtime.bigint();
@@ -66,23 +68,24 @@ export class BotRunner {
     } catch (error) {
       this.sandbox.__agentankFrame = null;
       this.sandbox.__agentankTurn = null;
-      return this.errorDecision(started, error);
+      return this.errorDecision(started, error, teamInfo);
     }
     const turn = this.sandbox.__agentankTurn;
     this.sandbox.__agentankFrame = null;
     this.sandbox.__agentankTurn = null;
-    if (turn?.status === "rejected") return this.errorDecision(started, turn.error);
-    if (turn?.status === "pending") return this.timeoutDecision(started);
-    return this.finishDecision(started, actions, context.me);
+    if (turn?.status === "rejected") return this.errorDecision(started, turn.error, teamInfo);
+    if (turn?.status === "pending") return this.timeoutDecision(started, undefined, teamInfo);
+    return this.finishDecision(started, actions, context.me, teamInfo);
   }
 
-  finishDecision(started, actions, snapshot = {}) {
+  finishDecision(started, actions, snapshot = {}, teamInfo = []) {
     const runtimeMs = Number(process.hrtime.bigint() - started) / 1e6;
     if (runtimeMs > this.timeoutMs) {
       return {
         action: { type: "timeout", runtimeMs },
         logs: this.logs.slice(),
-        runtimeMs
+        runtimeMs,
+        teamInfo: teamInfo.slice()
       };
     }
     const boostActive = isBoostActive(snapshot);
@@ -95,7 +98,8 @@ export class BotRunner {
       return {
         action,
         logs: this.logs.slice(),
-        runtimeMs
+        runtimeMs,
+        teamInfo: teamInfo.slice()
       };
     }
     if (boostActive && actions[0]?.type === "turn" && actions[1]?.type === "fire") {
@@ -107,7 +111,8 @@ export class BotRunner {
       return {
         action,
         logs: this.logs.slice(),
-        runtimeMs
+        runtimeMs,
+        teamInfo: teamInfo.slice()
       };
     }
     const [action, ...queued] = actions;
@@ -115,7 +120,8 @@ export class BotRunner {
     return {
       action: action || null,
       logs: this.logs.slice(),
-      runtimeMs
+      runtimeMs,
+      teamInfo: teamInfo.slice()
     };
   }
 
@@ -127,30 +133,32 @@ export class BotRunner {
       return null;
     }
     this.queue.shift();
-    return { action: entry.action, logs: [], runtimeMs: 0, queued: true };
+    return { action: entry.action, logs: [], runtimeMs: 0, queued: true, teamInfo: [] };
   }
 
   queueActions(actions, guard) {
     for (const action of actions) this.queue.push({ action, guard });
   }
 
-  timeoutDecision(started, error) {
+  timeoutDecision(started, error, teamInfo = []) {
     const runtimeMs = Number(process.hrtime.bigint() - started) / 1e6;
     return {
       action: { type: "timeout", runtimeMs },
       logs: this.logs.slice(),
       runtimeMs,
+      teamInfo: teamInfo.slice(),
       error
     };
   }
 
-  errorDecision(started, error) {
-    if (isVmTimeout(error)) return this.timeoutDecision(started, error);
+  errorDecision(started, error, teamInfo = []) {
+    if (isVmTimeout(error)) return this.timeoutDecision(started, error, teamInfo);
     const runtimeMs = Number(process.hrtime.bigint() - started) / 1e6;
     return {
       action: { type: "error", message: error?.message || String(error) },
       logs: this.logs.slice(),
       runtimeMs,
+      teamInfo: teamInfo.slice(),
       error
     };
   }
@@ -177,7 +185,7 @@ function queueGuardMatches(guard, snapshot = {}) {
   return true;
 }
 
-function createAgentProxy(snapshot, actions, logs) {
+function createAgentProxy(snapshot, actions, logs, teamInfo = []) {
   const reasonOf = () => agent.__actionReason || undefined;
   const withReason = (action) => {
     const reason = reasonOf();
@@ -186,6 +194,9 @@ function createAgentProxy(snapshot, actions, logs) {
   };
   const agent = {
     __debugActionReasonSink: true,
+    index: snapshot.index,
+    team: snapshot.team,
+    name: snapshot.name,
     tank: snapshot.tank,
     stars: snapshot.stars,
     bullet: snapshot.bullet,
@@ -234,6 +245,13 @@ function createAgentProxy(snapshot, actions, logs) {
     },
     print(...args) {
       logs.push({ type: "print", data: args.join(" ") });
+    },
+    sendTeamInfo(type, content, location) {
+      teamInfo.push({
+        type: String(type ?? ""),
+        content,
+        location: Array.isArray(location) ? location.slice() : undefined
+      });
     }
   };
   for (const skill of ["overload", "cloak", "teleport", "freeze", "shield", "stun", "poison", "boost"]) {

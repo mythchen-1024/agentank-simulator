@@ -4,11 +4,13 @@ import { blocksMovement, isSamePoint, openMap, pointKey } from "./map.js";
 export function createRandomScenario(options = {}) {
   const width = Math.max(7, Math.floor(Number(options.width) || 19));
   const height = Math.max(7, Math.floor(Number(options.height) || 15));
+  const count = Math.max(2, Math.floor(Number(options.count) || 2));
   const rng = options.rng || seededRandom(options.seed ?? 1);
   const map = openMap(width, height);
-  const fixedStarts = options.fixedStarts === false ? null : fixedSymmetricStarts(map);
+  // The fixed symmetric 1v1 starts only apply to 2-tank scenarios; N>2 picks N spaced starts.
+  const fixedStarts = count === 2 && options.fixedStarts !== false ? fixedSymmetricStarts(map) : null;
   fillRandomTerrain(map, rng, fixedStarts ? fixedStarts.map((start) => start.position) : []);
-  const starts = fixedStarts || pickStarts(map, rng);
+  const starts = fixedStarts || pickStarts(map, rng, count);
   const star = pickOpenCell(map, rng, starts.map((start) => start.position));
   return { map, tanks: starts, star };
 }
@@ -78,23 +80,28 @@ function randomTerrain(rng) {
   return ".";
 }
 
-function pickStarts(map, rng) {
+function pickStarts(map, rng, count = 2) {
+  const minSpacing = count <= 2 ? 6 : 3;
   for (let attempt = 0; attempt < 200; attempt += 1) {
-    const first = pickOpenCell(map, rng);
-    const second = pickOpenCell(map, rng, [first]);
-    if (manhattan(first, second) >= 6) {
-      return [
-        { position: first, direction: randomDirection(rng) },
-        { position: second, direction: randomDirection(rng) }
-      ];
+    const starts = [];
+    let ok = true;
+    for (let i = 0; i < count; i += 1) {
+      const position = pickOpenCell(map, rng, starts.map((start) => start.position));
+      if (starts.some((start) => manhattan(start.position, position) < minSpacing)) {
+        ok = false;
+        break;
+      }
+      starts.push({ position, direction: randomDirection(rng) });
     }
+    if (ok && starts.length === count) return starts;
   }
-  const first = pickOpenCell(map, rng);
-  const second = pickOpenCell(map, rng, [first]);
-  return [
-    { position: first, direction: randomDirection(rng) },
-    { position: second, direction: randomDirection(rng) }
-  ];
+  // Fallback: accept whatever distinct cells we can find without the spacing guarantee.
+  const starts = [];
+  for (let i = 0; i < count; i += 1) {
+    const position = pickOpenCell(map, rng, starts.map((start) => start.position));
+    starts.push({ position, direction: randomDirection(rng) });
+  }
+  return starts;
 }
 
 function pickOpenCell(map, rng, excluded = []) {
@@ -117,6 +124,7 @@ function randomDirection(rng) {
 }
 
 function tankChar(index, direction) {
+  if (index >= 2) return String(index); // players 2-9 serialize as a single digit (position only)
   const chars = index === 0 ? "abcd" : "ABCD";
   const directionIndex = DIRECTIONS.indexOf(direction);
   return chars[directionIndex >= 0 ? directionIndex : 0];

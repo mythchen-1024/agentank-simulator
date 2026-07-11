@@ -74,6 +74,25 @@ testSimulateLocalRandomMapMode();
 await testIsolatedBotRunnerBlocksHostFileAccess();
 await testIsolatedBotRunnerClosesWorkerAfterInitError();
 
+testFfaSnapshotShape();
+testPrimaryOpponentThreatScoreSelection();
+testSingleTargetSkillHitsPrimaryOnly();
+testTeleportFireLockTargetsPrimaryOnly();
+testTeammatesCannotShareCell();
+testTeammateBulletsPassThrough();
+testFfaTanksAreMutualEnemies();
+testFfaEndsWhenOneSurvivorRemains();
+testTeamsEndWhenOneTeamWiped();
+testFfaFrameLimitRankingByStars();
+testTeamsRankingByTotalStars();
+testEliminationsRecordCauseAndKiller();
+await testTeamChatDeliversNextFrameToTeammatesOnly();
+await testTeamChatConstraintsDropExtraOversizeAndInvalid();
+await testIsolatedRunnerCarriesTeamInfo();
+await testRunAcceptsArrayAndVariadicBots();
+testCloneIsDeterministicForMultiplayer();
+testRawMapParsesNumericExtraTanks();
+
 console.log("simulator check passed");
 
 function testFrameOrderMovesPlayersBeforeBullets() {
@@ -1249,4 +1268,362 @@ async function waitForChildExit(child) {
 
 function manhattan(a, b) {
   return Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]);
+}
+
+// Multiplayer / team-mode coverage
+// ---------------------------------------------------------------------------
+
+function ffaSim(extra = {}) {
+  return new AgenTankSimulator({
+    map: openMap(15, 9),
+    tanks: [
+      { id: "a", position: [2, 4], direction: "right", skillType: "freeze" },
+      { id: "b", position: [7, 4], direction: "left", skillType: "overload" },
+      { id: "c", position: [12, 4], direction: "left", skillType: "teleport" }
+    ],
+    ...extra
+  });
+}
+
+function testFfaSnapshotShape() {
+  const sim = ffaSim();
+  const snap = sim.snapshotFor(0);
+  assert.equal(snap.game.myIndex, 0);
+  assert.equal(snap.game.alivePlayers, 3);
+  assert.equal(snap.game.team, null);
+  assert.deepEqual(snap.game.allies, []);
+  assert.equal(snap.game.enemies.length, 2, "two visible enemies in 3-way FFA");
+  assert.equal(snap.game.players.length, 3, "players array spans the whole field");
+  assert.equal(Array.isArray(snap.game.visibleBullets), true);
+  assert.equal(snap.me.index, 0);
+  assert.equal(snap.me.team, null);
+  assert.equal(snap.me.name, "a");
+}
+
+function testPrimaryOpponentThreatScoreSelection() {
+  // b at dist 5 (score 5); c at dist 8 but holds a bullet (8-5=3) -> c is the higher threat.
+  const sim = new AgenTankSimulator({
+    map: openMap(15, 9),
+    tanks: [
+      { id: "a", position: [2, 4], direction: "right", skillType: "freeze" },
+      { id: "b", position: [7, 4], direction: "left", skillType: "overload" },
+      { id: "c", position: [10, 4], direction: "left", skillType: "teleport" }
+    ]
+  });
+  sim.bullets.push({ objectId: "cs", ownerIndex: 2, ownerObjectId: "c", position: [9, 4], direction: "left", crashed: false });
+  assert.equal(sim.primaryOpponentIndexFor(sim.players[0]), 2, "bullet holder is prioritised");
+
+  // Without the bullet, the nearer enemy (b) wins.
+  const plain = ffaSim();
+  assert.equal(plain.primaryOpponentIndexFor(plain.players[0]), 1, "nearest enemy by default");
+}
+
+function testSingleTargetSkillHitsPrimaryOnly() {
+  // a uses freeze; primary should be the nearer b, not c.
+  const sim = ffaSim();
+  sim.step([{ type: "freeze" }, null, null]);
+  assert.equal(sim.snapshotFor(1).me.status.frozen, true, "primary opponent b is frozen");
+  assert.equal(sim.snapshotFor(2).me.status.frozen, false, "non-primary c is untouched");
+}
+
+function testTeleportFireLockTargetsPrimaryOnly() {
+  // Teleport within 4 of the primary locks fire; landing far from primary does not.
+  const near = new AgenTankSimulator({
+    map: openMap(20, 9),
+    tanks: [
+      { id: "a", position: [1, 4], direction: "right", skillType: "teleport" },
+      { id: "b", position: [10, 4], direction: "left", skillType: "overload" },
+      { id: "c", position: [18, 4], direction: "left", skillType: "overload" }
+    ]
+  });
+  near.step([{ type: "teleport", x: 7, y: 4 }, null, null]); // primary b is at [10,4], dist 3
+  assert.equal(near.snapshotFor(0).me.status.fireLocked, true);
+
+  const far = new AgenTankSimulator({
+    map: openMap(20, 9),
+    tanks: [
+      { id: "a", position: [1, 4], direction: "right", skillType: "teleport" },
+      { id: "b", position: [16, 4], direction: "left", skillType: "overload" },
+      { id: "c", position: [18, 4], direction: "left", skillType: "overload" }
+    ]
+  });
+  // Primary is the nearest enemy b at [16,4]; teleport to [3,4] is far from it -> no lock.
+  far.step([{ type: "teleport", x: 3, y: 4 }, null, null]);
+  assert.equal(far.snapshotFor(0).me.status.fireLocked, false);
+}
+
+function teamsSim(extra = {}) {
+  // 2v2: teams [0,0,1,1]
+  return new AgenTankSimulator({
+    map: openMap(15, 9),
+    tanks: [
+      { id: "a", position: [2, 4], direction: "right", skillType: "overload" },
+      { id: "b", position: [3, 4], direction: "right", skillType: "overload" },
+      { id: "c", position: [11, 4], direction: "left", skillType: "overload" },
+      { id: "d", position: [12, 4], direction: "left", skillType: "overload" }
+    ],
+    teams: [0, 0, 1, 1],
+    ...extra
+  });
+}
+
+function testTeammatesCannotShareCell() {
+  // a at [2,4] tries to move right into teammate b at [3,4]; blocked, neither crashes.
+  const sim = teamsSim();
+  sim.step([{ type: "go" }, null, null, null]);
+  assert.deepEqual(sim.players[0].position, [2, 4], "blocked by teammate");
+  assert.equal(sim.players[0].crashed, false);
+  assert.equal(sim.players[1].crashed, false);
+  assert.equal(sim.result, null);
+}
+
+function testTeammateBulletsPassThrough() {
+  // a fires right; teammate b sits directly in the path and must NOT be hit. The bullet keeps going.
+  const sim = new AgenTankSimulator({
+    map: openMap(15, 5),
+    tanks: [
+      { id: "a", position: [2, 2], direction: "right", skillType: "overload" },
+      { id: "b", position: [4, 2], direction: "right", skillType: "shield" },
+      { id: "c", position: [10, 2], direction: "left", skillType: "overload" },
+      { id: "d", position: [11, 2], direction: "left", skillType: "overload" }
+    ],
+    teams: [0, 0, 1, 1]
+  });
+  // b raises shield; an allied bullet must neither break it nor crash b.
+  sim.step([null, { type: "shield" }, null, null]);
+  sim.step([{ type: "fire" }, null, null, null]);
+  sim.step([null, null, null, null]);
+  assert.equal(sim.players[1].crashed, false, "teammate not hit");
+  assert.equal(sim.snapshotFor(1).me.status.shielded, true, "ally shield not consumed");
+}
+
+function testFfaTanksAreMutualEnemies() {
+  // a shoots b; in FFA any other tank is a valid target.
+  const sim = new AgenTankSimulator({
+    map: openMap(12, 5),
+    tanks: [
+      { id: "a", position: [2, 2], direction: "right", skillType: "overload" },
+      { id: "b", position: [5, 2], direction: "left", skillType: "overload" },
+      { id: "c", position: [9, 2], direction: "left", skillType: "overload" }
+    ]
+  });
+  sim.step([{ type: "fire" }, null, null]);
+  sim.step([null, null, null]);
+  assert.equal(sim.players[1].crashed, true, "FFA bullet crashes another tank");
+}
+
+function testFfaEndsWhenOneSurvivorRemains() {
+  // Pre-crash c; then a kills b -> one survivor -> match ends with ranking + eliminations.
+  const sim = new AgenTankSimulator({
+    map: openMap(12, 5),
+    tanks: [
+      { id: "a", position: [2, 2], direction: "right", skillType: "overload" },
+      { id: "b", position: [5, 2], direction: "left", skillType: "overload" },
+      { id: "c", position: [9, 2], direction: "left", skillType: "overload" }
+    ]
+  });
+  sim.players[2].crashed = true; // c already out
+  sim.step([{ type: "fire" }, null, null]);
+  sim.step([null, null, null]);
+  assert.equal(sim.players[1].crashed, true);
+  assert.equal(sim.result.reason, "crashed");
+  assert.equal(sim.result.winner, 0, "lone survivor wins");
+  assert.equal(Array.isArray(sim.result.ranking), true);
+  assert.equal(sim.result.ranking[0], 0);
+  assert.equal(Array.isArray(sim.result.eliminations), true);
+}
+
+function testTeamsEndWhenOneTeamWiped() {
+  // Team 1 (c,d) is pre-crashed except d; a kills d -> team 0 is the only team alive -> end.
+  const sim = new AgenTankSimulator({
+    map: openMap(14, 5),
+    tanks: [
+      { id: "a", position: [2, 2], direction: "right", skillType: "overload" },
+      { id: "b", position: [3, 2], direction: "right", skillType: "overload" },
+      { id: "c", position: [9, 2], direction: "left", skillType: "overload" },
+      { id: "d", position: [6, 2], direction: "left", skillType: "overload" }
+    ],
+    teams: [0, 0, 1, 1]
+  });
+  sim.players[2].crashed = true; // c out, d at [6,2] remains
+  sim.step([{ type: "fire" }, null, null, null]);
+  sim.step([null, null, null, null]);
+  assert.equal(sim.players[3].crashed, true);
+  assert.equal(sim.result.reason, "crashed");
+  // winner is from team 0 (a or b), both alive
+  assert.equal([0, 1].includes(sim.result.winner), true);
+}
+
+function testFfaFrameLimitRankingByStars() {
+  const sim = new AgenTankSimulator({
+    map: openMap(12, 5),
+    maxFrames: 1,
+    tanks: [
+      { id: "a", position: [2, 2], direction: "right", skillType: "overload", stars: 1 },
+      { id: "b", position: [5, 2], direction: "left", skillType: "overload", stars: 3 },
+      { id: "c", position: [9, 2], direction: "left", skillType: "overload", stars: 2 }
+    ]
+  });
+  sim.step([null, null, null]); // hits frame limit
+  sim.finishByScore();
+  assert.equal(sim.result.reason, "frameLimit");
+  assert.deepEqual(sim.result.ranking, [1, 2, 0], "ranked by stars descending");
+  assert.equal(sim.result.winner, 1);
+}
+
+function testTeamsRankingByTotalStars() {
+  // Team 0 total = 1+1 = 2; team 1 total = 3+0 = 3 -> team 1 ranks first.
+  const sim = new AgenTankSimulator({
+    map: openMap(15, 5),
+    maxFrames: 1,
+    tanks: [
+      { id: "a", position: [2, 2], direction: "right", skillType: "overload", stars: 1 },
+      { id: "b", position: [3, 2], direction: "right", skillType: "overload", stars: 1 },
+      { id: "c", position: [11, 2], direction: "left", skillType: "overload", stars: 3 },
+      { id: "d", position: [12, 2], direction: "left", skillType: "overload", stars: 0 }
+    ],
+    teams: [0, 0, 1, 1]
+  });
+  sim.step([null, null, null, null]);
+  sim.finishByScore();
+  assert.equal(sim.result.reason, "frameLimit");
+  // team 1 first (c before d by stars), then team 0 (a/b tie by stars -> index order)
+  assert.deepEqual(sim.result.ranking, [2, 3, 0, 1]);
+  assert.equal(sim.result.winner, 2);
+}
+
+function testEliminationsRecordCauseAndKiller() {
+  const sim = new AgenTankSimulator({
+    map: openMap(12, 5),
+    tanks: [
+      { id: "a", position: [2, 2], direction: "right", skillType: "overload" },
+      { id: "b", position: [5, 2], direction: "left", skillType: "overload" },
+      { id: "c", position: [9, 2], direction: "left", skillType: "overload" }
+    ]
+  });
+  sim.players[2].crashed = true;
+  sim.step([{ type: "fire" }, null, null]);
+  sim.step([null, null, null]);
+  const bulletKill = sim.result.eliminations.find((entry) => entry.reason === "bullet");
+  assert.equal(bulletKill.index, 1, "victim recorded");
+  assert.equal(bulletKill.by, 0, "killer recorded");
+  assert.equal(typeof bulletKill.frame, "number");
+}
+
+async function testTeamChatDeliversNextFrameToTeammatesOnly() {
+  const sim = teamsSim();
+  // a (team 0) broadcasts; b (team 0) should read it next frame, c/d (team 1) never.
+  const senderDecision = { action: null, logs: [], runtimeMs: 0, teamInfo: [{ type: "target", content: "focus", location: [9, 4] }] };
+  const idle = { action: null, logs: [], runtimeMs: 0, teamInfo: [] };
+  // Same-frame send: inbox not yet visible.
+  assert.deepEqual(sim.snapshotFor(1).game.teamInfo, []);
+  sim.step([null, null, null, null], [senderDecision, idle, idle, idle]);
+  // Next frame: teammate b sees it, enemy c does not.
+  const allyInbox = sim.snapshotFor(1).game.teamInfo;
+  assert.equal(allyInbox.length, 1, "teammate receives one message next frame");
+  assert.equal(allyInbox[0].type, "target");
+  assert.equal(allyInbox[0].from, 0);
+  assert.deepEqual(allyInbox[0].location, [9, 4]);
+  assert.deepEqual(sim.snapshotFor(2).game.teamInfo, [], "enemy team gets nothing");
+}
+
+async function testTeamChatConstraintsDropExtraOversizeAndInvalid() {
+  const sim = teamsSim();
+  const idle = { action: null, logs: [], runtimeMs: 0, teamInfo: [] };
+  // a: two messages (only first kept). b: oversize (>1KB) dropped. c is enemy team anyway.
+  const multi = { action: null, logs: [], runtimeMs: 0, teamInfo: [
+    { type: "help", content: "first" },
+    { type: "warn", content: "second" }
+  ] };
+  const oversize = { action: null, logs: [], runtimeMs: 0, teamInfo: [{ type: "info", content: "x".repeat(2000) }] };
+  sim.step([null, null, null, null], [multi, oversize, idle, idle]);
+  const inbox = sim.snapshotFor(0).game.teamInfo; // team 0 reads a + b sends
+  assert.equal(inbox.length, 1, "only a's first message survives");
+  assert.equal(inbox[0].content, "first");
+
+  // invalid type dropped
+  const sim2 = teamsSim();
+  const bad = { action: null, logs: [], runtimeMs: 0, teamInfo: [{ type: "bogus", content: "nope" }] };
+  sim2.step([null, null, null, null], [bad, idle, idle, idle]);
+  assert.deepEqual(sim2.snapshotFor(1).game.teamInfo, [], "invalid type rejected");
+}
+
+async function testIsolatedRunnerCarriesTeamInfo() {
+  const dir = mkdtempSync(join(tmpdir(), "agentank-team-"));
+  try {
+    const botFile = join(dir, "chatter.js");
+    writeFileSync(botFile, `
+      function onIdle(me) {
+        me.sendTeamInfo("target", "focus", [3, 3]);
+        me.go();
+      }
+    `);
+    const bot = await loadIsolatedBotFromFile(botFile, { timeoutMs: 50 });
+    try {
+      const decision = await bot.decide({
+        me: { index: 0, team: "ally", name: "a", tank: { id: "a", position: [1, 1], direction: "right" }, stars: 0, bullet: null, skill: null, status: {}, effects: {} },
+        enemy: { tank: null, stars: 0, bullet: null, skill: null, status: {}, effects: {} },
+        game: { frames: 0, star: null, map: [], teamInfo: [] }
+      });
+      assert.equal(Array.isArray(decision.teamInfo), true);
+      assert.equal(decision.teamInfo.length, 1, "team message survives IPC round trip");
+      assert.equal(decision.teamInfo[0].type, "target");
+      assert.deepEqual(decision.teamInfo[0].location, [3, 3]);
+    } finally {
+      bot.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function testRunAcceptsArrayAndVariadicBots() {
+  const code = "function onIdle(me) { me.go(); }";
+  const variadic = new AgenTankSimulator({ map: openMap(10, 5), maxFrames: 2, tanks: [
+    { id: "a", position: [2, 2], direction: "right" },
+    { id: "b", position: [7, 2], direction: "left" }
+  ] });
+  variadic.run(loadBotFromCode(code), loadBotFromCode(code));
+  assert.equal(variadic.result != null, true, "run(a, b) finishes");
+
+  const arrayForm = new AgenTankSimulator({ map: openMap(14, 5), maxFrames: 2, tanks: [
+    { id: "a", position: [2, 2], direction: "right" },
+    { id: "b", position: [7, 2], direction: "left" },
+    { id: "c", position: [11, 2], direction: "left" }
+  ] });
+  arrayForm.run([loadBotFromCode(code), loadBotFromCode(code), loadBotFromCode(code)]);
+  assert.equal(arrayForm.result != null, true, "run([b0, b1, b2]) finishes");
+  assert.equal(arrayForm.result.ranking.length, 3, "3-player ranking present");
+}
+
+function testCloneIsDeterministicForMultiplayer() {
+  const sim = ffaSim();
+  sim.step([{ type: "go" }, { type: "go" }, null]);
+  const copy = sim.clone();
+  assert.equal(copy.mode, sim.mode);
+  assert.equal(copy.multiplayer, true);
+  assert.equal(copy.players.length, 3);
+  assert.notEqual(copy.players, sim.players);
+  // mutating the clone must not bleed into the original
+  copy.players[0].position[0] = 99;
+  assert.notEqual(sim.players[0].position[0], 99);
+  copy.eliminations.push({ index: 9 });
+  assert.notEqual(sim.eliminations.length, copy.eliminations.length);
+}
+
+function testRawMapParsesNumericExtraTanks() {
+  const parsed = parseRawMap([
+    "xxxxxxx",
+    "xa...Ax",
+    "x2...3x",
+    "xxxxxxx"
+  ].join("|"));
+  assert.deepEqual(parsed.tanks[0].position, [1, 1]);
+  assert.deepEqual(parsed.tanks[1].position, [5, 1]);
+  assert.deepEqual(parsed.tanks[2], { position: [1, 2], direction: "up" });
+  assert.deepEqual(parsed.tanks[3], { position: [5, 2], direction: "up" });
+  // round-trip via serializeRawMap keeps positions for N>2
+  const round = serializeRawMap(parsed.map, parsed.tanks);
+  const reparsed = parseRawMap(round);
+  assert.deepEqual(reparsed.tanks.map((tank) => tank.position), parsed.tanks.map((tank) => tank.position));
 }

@@ -28,6 +28,7 @@ function sanitizeDecision(decision) {
     logs: decision.logs || [],
     runtimeMs: Number(decision.runtimeMs || 0),
     queued: decision.queued || undefined,
+    teamInfo: Array.isArray(decision.teamInfo) ? decision.teamInfo : [],
     error: decision.error ? serializeError(decision.error) : undefined
   };
 }

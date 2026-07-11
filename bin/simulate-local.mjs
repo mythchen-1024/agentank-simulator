@@ -12,24 +12,35 @@ if (args.help) {
   console.log(printUsage());
   process.exit(0);
 }
-if (!args.botA || !args.botB || (!args.map && !args.randomMap)) {
+
+// Resolve the bot list: prefer repeatable --bot, fall back to legacy --bot-a/--bot-b.
+const botPaths = args.bots.length ? args.bots : [args.botA, args.botB].filter(Boolean);
+if (botPaths.length < 2 || (!args.map && !args.randomMap)) {
   console.error(printUsage());
   process.exit(1);
 }
 
 const randomSeed = args.seed ?? (args.randomMap ? 1 : undefined);
 const scenario = args.randomMap
-  ? createRandomScenario({ width: args.width, height: args.height, seed: randomSeed })
+  ? createRandomScenario({ width: args.width, height: args.height, seed: randomSeed, count: botPaths.length })
   : parseRawMap(args.map);
 const initialStar = args.star ? args.star.split(",").map(Number) : scenario.star || null;
 const botOptions = { timeoutMs: positiveNumber(args.botTimeoutMs, DEFAULT_BOT_TIMEOUT_MS, "--bot-timeout-ms") };
-const botA = await loadIsolatedBotFromFile(resolve(args.botA), botOptions);
-const botB = await loadIsolatedBotFromFile(resolve(args.botB), botOptions);
+
+// Skills: repeatable --skill, else legacy --skill-a/--skill-b, else sensible defaults.
+const skills = args.skills.length
+  ? args.skills
+  : [args.skillA || "teleport", args.skillB || "overload"];
+const teams = args.teams.length ? args.teams.map(Number) : undefined;
+
+const bots = await Promise.all(botPaths.map((path) => loadIsolatedBotFromFile(resolve(path), botOptions)));
 const sim = new AgenTankSimulator({
   seed: randomSeed == null ? undefined : Number(randomSeed),
   map: scenario.map,
   tanks: scenario.tanks,
-  skills: [args.skillA || "teleport", args.skillB || "overload"],
+  skills,
+  teams,
+  mode: teams ? "teams" : undefined,
   maxFrames: Number(args.maxFrames || 300),
   starLimit: args.starLimit ? positiveNumber(args.starLimit, null, "--star-limit") : null,
   star: initialStar
@@ -37,13 +48,15 @@ const sim = new AgenTankSimulator({
 
 let result;
 try {
-  result = await sim.runAsync(botA, botB);
+  result = await sim.runAsync(bots);
 } finally {
-  botA.close();
-  botB.close();
+  for (const bot of bots) bot.close();
 }
 const summary = result.result || result.replayData.replay.meta.result;
-console.log(`winner=${summary.winner ?? "draw"} reason=${summary.reason} frames=${result.replayData.replay.records.length}`);
+let line = `winner=${summary.winner ?? "draw"} reason=${summary.reason} frames=${result.replayData.replay.records.length}`;
+if (summary.ranking) line += ` ranking=${summary.ranking.join(",")}`;
+if (summary.eliminations) line += ` eliminations=${summary.eliminations.length}`;
+console.log(line);
 if (args.randomMap) {
   console.log(`map=${serializeRawMap(scenario.map, scenario.tanks)}`);
   if (initialStar) console.log(`star=${initialStar.join(",")}`);
@@ -55,10 +68,11 @@ if (args.out) {
 }
 
 function parseArgs(argv) {
-  const out = {};
+  const out = { bots: [], skills: [], teams: [] };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") out.help = true;
+    else if (arg === "--bot") out.bots.push(argv[++i]);
     else if (arg === "--bot-a") out.botA = argv[++i];
     else if (arg === "--bot-b") out.botB = argv[++i];
     else if (arg === "--map") out.map = argv[++i];
@@ -66,6 +80,8 @@ function parseArgs(argv) {
     else if (arg === "--width") out.width = argv[++i];
     else if (arg === "--height") out.height = argv[++i];
     else if (arg === "--seed") out.seed = argv[++i];
+    else if (arg === "--skill") out.skills.push(argv[++i]);
+    else if (arg === "--team") out.teams.push(argv[++i]);
     else if (arg === "--skill-a") out.skillA = argv[++i];
     else if (arg === "--skill-b") out.skillB = argv[++i];
     else if (arg === "--bot-timeout-ms") out.botTimeoutMs = argv[++i];
@@ -80,11 +96,15 @@ function parseArgs(argv) {
 function printUsage() {
   return `Usage:
   agentank-simulate-local --bot-a path/to/a.js --bot-b path/to/b.js --map 'a...|....|...A' [options]
-  agentank-simulate-local --bot-a path/to/a.js --bot-b path/to/b.js --random-map [options]
+  agentank-simulate-local --bot a.js --bot b.js --bot c.js --random-map [options]
+  agentank-simulate-local --bot a.js --bot b.js --bot c.js --bot d.js --team 0 --team 0 --team 1 --team 1 --random-map
 
 Options:
-  --skill-a <skill>          Player A skill. Default: teleport
-  --skill-b <skill>          Player B skill. Default: overload
+  --bot <path>               Add a bot (repeatable; N bots = N-player match)
+  --team <id>                Team id for the corresponding --bot (repeatable; enables team mode)
+  --skill <skill>            Skill for the corresponding --bot (repeatable)
+  --bot-a / --bot-b <path>   Legacy 1v1 bot paths
+  --skill-a / --skill-b <s>  Legacy 1v1 skills. Defaults: teleport / overload
   --star <x,y>               Initial star position
   --max-frames <n>           Frame limit. Default: 300
   --star-limit <n>           Optional early win threshold
